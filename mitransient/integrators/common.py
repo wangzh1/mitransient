@@ -257,9 +257,11 @@ class TransientADIntegrator(ADIntegrator):
                 # Differentiate sample splatting and weight division steps
                 grad_in_image, grad_in_transient = grad_in
                 dr.set_grad(transient_image, grad_in_transient)
+                # dr.set_grad(steady_image, grad_in_image)
                 
                 # Replace traverse with manual backward pass
                 dr.enqueue(dr.ADMode.Backward, transient_image)
+                # dr.enqueue(dr.ADMode.Backward, steady_image)
                 dr.traverse(dr.ADMode.Backward) 
                 
 
