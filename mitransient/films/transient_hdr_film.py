@@ -142,7 +142,6 @@ class TransientHDRFilm(mi.Film):
 
         if raw:
             return self.transient_storage.tensor
-
         data = self.transient_storage.tensor
 
         pixel_count = dr.prod(data.shape[0:-1])

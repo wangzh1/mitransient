@@ -103,6 +103,97 @@ class TransientADIntegrator(ADIntegrator):
         self.check_transient_(scene, sensor)
 
         # Disable derivatives in all of the following
+        # with dr.suspend_grad():
+            # Prepare the film and sample generator for rendering
+        samplers_spps = self.prepare(
+            scene=scene,
+            sensor=sensor,
+            seed=seed,
+            spp=spp,
+            aovs=self.aov_names()
+        )
+
+        # need to re-add in case the spp parameter was set to 0
+        # (spp was set through the xml file)
+        total_spp = 0
+        for _, spp_i in samplers_spps:
+            total_spp += spp_i
+        print(total_spp)
+        for i, (sampler_i, spp_i) in enumerate(samplers_spps):
+
+            # Generate a set of rays starting at the sensor
+            ray, weight, pos = self.sample_rays(scene, sensor, sampler_i)
+
+            # Launch the Monte Carlo sampling process in primal mode
+            L, valid, aovs, _ = self.sample(
+                mode=dr.ADMode.Primal,
+                scene=scene,
+                sampler=sampler_i,
+                ray=ray,
+                depth=mi.UInt32(0),
+                δL=None,
+                δaovs=None,
+                state_in=None,
+                active=mi.Bool(True),
+                add_transient=self.add_transient_f(
+                    film=film, pos=pos, ray_weight=weight, sample_scale=1.0 / total_spp
+                )
+            )
+
+            # Prepare an ImageBlock as specified by the film
+            block = film.steady.create_block()
+
+            # Only use the coalescing feature when rendering enough samples
+            block.set_coalesce(block.coalesce() and spp_i >= 4)
+
+            # Accumulate into the image block
+            ADIntegrator._splat_to_block(
+                block, film, pos,
+                value=L * weight,
+                weight=1.0,
+                alpha=dr.select(valid, mi.Float(1), mi.Float(0)),
+                aovs=aovs,
+                wavelengths=ray.wavelengths
+            )
+
+            # Explicitly delete any remaining unused variables
+            del sampler_i, ray, weight, pos, L, valid
+
+            # Perform the weight division and return an image tensor
+            film.steady.put_block(block)
+
+            # Report progress
+            if progress_callback:
+                progress_callback((i + 1) / len(samplers_spps))
+
+            steady_image, transient_image = film.develop()
+            return steady_image, transient_image
+
+    # def render_forward(self: mi.SamplingIntegrator,
+    #                    scene: mi.Scene,
+    #                    params: Any,
+    #                    sensor: Union[int, mi.Sensor] = 0,
+    #                    seed: mi.UInt32 = 0,
+    #                    spp: int = 0) -> mi.TensorXf:
+    #     # TODO implement render_forward (either here or move this function to RBIntegrator)
+    #     raise NotImplementedError(
+    #         "Check https://github.com/mitsuba-renderer/mitsuba3/blob/1e513ef94db0534f54a884f2aeab7204f6f1e3ed/src/python/python/ad/integrators/common.py"
+    #     )
+
+    def render_backward(self: mi.SamplingIntegrator,
+                        scene: mi.Scene,
+                        params: Any,
+                        grad_in: mi.TensorXf,
+                        sensor: Union[int, mi.Sensor] = 0,
+                        seed: mi.UInt32 = 0,
+                        spp: int = 0) -> None:
+        if isinstance(sensor, int):
+            sensor = scene.sensors()[sensor]
+
+        film = sensor.film()
+        self.check_transient_(scene, sensor)
+
+        # Disable derivatives in all of the following
         with dr.suspend_grad():
             # Prepare the film and sample generator for rendering
             samplers_spps = self.prepare(
@@ -113,17 +204,18 @@ class TransientADIntegrator(ADIntegrator):
                 aovs=self.aov_names()
             )
 
-            # need to re-add in case the spp parameter was set to 0
-            # (spp was set through the xml file)
+            # Generate a set of rays starting at the sensor, keep track of
+            # derivatives wrt. sample positions ('pos') if there are any
             total_spp = 0
+
             for _, spp_i in samplers_spps:
                 total_spp += spp_i
 
-            for i, (sampler_i, spp_i) in enumerate(samplers_spps):
-                # Generate a set of rays starting at the sensor
-                ray, weight, pos = self.sample_rays(scene, sensor, sampler_i)
+            # Process all passes in a single batch to avoid complex loops
+            sampler_i, spp_i = samplers_spps[0]  # Use first sampler
+            ray, weight, pos = self.sample_rays(scene, sensor, sampler_i)
 
-                # Launch the Monte Carlo sampling process in primal mode
+            with dr.resume_grad():
                 L, valid, aovs, _ = self.sample(
                     mode=dr.ADMode.Primal,
                     scene=scene,
@@ -138,7 +230,6 @@ class TransientADIntegrator(ADIntegrator):
                         film=film, pos=pos, ray_weight=weight, sample_scale=1.0 / total_spp
                     )
                 )
-
                 # Prepare an ImageBlock as specified by the film
                 block = film.steady.create_block()
 
@@ -155,41 +246,26 @@ class TransientADIntegrator(ADIntegrator):
                     wavelengths=ray.wavelengths
                 )
 
-                # Explicitly delete any remaining unused variables
-                del sampler_i, ray, weight, pos, L, valid
-
-                # Perform the weight division and return an image tensor
                 film.steady.put_block(block)
 
-                # Report progress
-                if progress_callback:
-                    progress_callback((i + 1) / len(samplers_spps))
+                del valid
 
-            steady_image, transient_image = film.develop()
-            return steady_image, transient_image
+                # This step launches a kernel
+                dr.schedule(block.tensor())
+                steady_image, transient_image = film.develop()
 
-    def render_forward(self: mi.SamplingIntegrator,
-                       scene: mi.Scene,
-                       params: Any,
-                       sensor: Union[int, mi.Sensor] = 0,
-                       seed: mi.UInt32 = 0,
-                       spp: int = 0) -> mi.TensorXf:
-        # TODO implement render_forward (either here or move this function to RBIntegrator)
-        raise NotImplementedError(
-            "Check https://github.com/mitsuba-renderer/mitsuba3/blob/1e513ef94db0534f54a884f2aeab7204f6f1e3ed/src/python/python/ad/integrators/common.py"
-        )
+                # Differentiate sample splatting and weight division steps
+                grad_in_image, grad_in_transient = grad_in
+                dr.set_grad(transient_image, grad_in_transient)
+                
+                # Replace traverse with manual backward pass
+                dr.enqueue(dr.ADMode.Backward, transient_image)
+                dr.traverse(dr.ADMode.Backward) 
+                
 
-    def render_backward(self: mi.SamplingIntegrator,
-                        scene: mi.Scene,
-                        params: Any,
-                        grad_in: mi.TensorXf,
-                        sensor: Union[int, mi.Sensor] = 0,
-                        seed: mi.UInt32 = 0,
-                        spp: int = 0) -> None:
-        # TODO implement render_backward (either here or move this function to RBIntegrator)
-        raise NotImplementedError(
-            "Check https://github.com/mitsuba-renderer/mitsuba3/blob/1e513ef94db0534f54a884f2aeab7204f6f1e3ed/src/python/python/ad/integrators/common.py"
-        )
+            del ray, weight, pos, block, sampler_i
+            # Clean up all variables
+            dr.eval()
 
     def add_transient_f(self, film: TransientHDRFilm, pos: mi.Vector2f, ray_weight: mi.Float, sample_scale: mi.Float):
         """
