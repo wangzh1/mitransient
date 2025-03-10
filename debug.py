@@ -14,11 +14,9 @@ params = mi.traverse(scene)
 initial_vertex_pos = dr.unravel(mi.Point3f, params['light.vertex_positions'])
 
 def apply_transformation(params, opt):
-    
     trafo = mi.Transform4f().translate([opt['trans'].x, opt['trans'].y, 0.0])
     opt['trans'].y = dr.clip(opt['trans'].y, 0, 1)
     params['light.vertex_positions'] = dr.ravel(trafo @ initial_vertex_pos)
-    params.update()
 
 opt = mi.ad.Adam(lr=1)
 opt['trans'] = mi.Point2f(50.0, 0.0)
@@ -36,6 +34,7 @@ for it in range(10000):
     dr.backward(loss)
 
     opt.step()
+    params.update(opt)
     # import pdb; pdb.set_trace()
     loss_hist.append(loss)
     

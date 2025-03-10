@@ -118,7 +118,7 @@ class TransientADIntegrator(ADIntegrator):
         total_spp = 0
         for _, spp_i in samplers_spps:
             total_spp += spp_i
-        print(total_spp)
+
         for i, (sampler_i, spp_i) in enumerate(samplers_spps):
 
             # Generate a set of rays starting at the sensor
