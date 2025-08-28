@@ -5,7 +5,7 @@ import drjit as dr
 import mitsuba as mi
 from mitsuba.ad.integrators.common import mis_weight  # type: ignore
 
-from .common import TransientADIntegrator
+from .common import TransientADIntegrator, TransientRBIntegrator
 
 
 def index_spectrum(spec, idx):
@@ -16,7 +16,7 @@ def index_spectrum(spec, idx):
     return m
 
 
-class TransientPRBVolpathIntegrator(TransientADIntegrator):
+class TransientPRBVolpathIntegrator(TransientRBIntegrator):
     r"""
     .. _integrator-prbvolpath:
 
