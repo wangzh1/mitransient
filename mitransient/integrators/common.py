@@ -256,6 +256,8 @@ class TransientADIntegrator(ADIntegrator):
 
         # Differentiate sample splatting and weight division steps
         grad_in_image, grad_in_transient = grad_in
+        # import pdb; pdb.set_trace()
+        # print(dr.sum(grad_in_image), dr.sum(grad_in_transient))
         dr.set_grad(transient_image, grad_in_transient)
         # dr.set_grad(steady_image, grad_in_image)
         
@@ -332,6 +334,41 @@ class TransientRBIntegrator(TransientADIntegrator):
         """
         Evaluates the reverse-mode derivative of the rendering step.
         """
+        def splatting_and_backward_gradient_image(value: mi.Spectrum,
+                                                  weight: mi.Float,
+                                                  alpha: mi.Float,
+                                                  aovs: Sequence[mi.Float]):
+            '''
+            Backward propagation of the gradient image through the sample
+            splatting and weight division steps.
+            '''
+
+            # Prepare an ImageBlock as specified by the film
+            block = film.steady.create_block()
+
+            # Only use the coalescing feature when rendering enough samples
+            block.set_coalesce(block.coalesce() and spp >= 4)
+
+            ADIntegrator._splat_to_block(
+                block, film, pos,
+                value=value,
+                weight=weight,
+                alpha=alpha,
+                aovs=aovs,
+                wavelengths=ray.wavelengths
+            )
+
+            film.steady.put_block(block)
+
+            steady_image, transient_image = film.develop()
+
+            # Differentiate sample splatting and weight division steps
+            grad_in_image, grad_in_transient = grad_in
+            print(dr.sum(grad_in_image), dr.sum(grad_in_transient))
+            dr.set_grad(steady_image, grad_in_image)
+            dr.enqueue(dr.ADMode.Backward, steady_image)
+            dr.traverse(dr.ADMode.Backward)
+        
         
         if isinstance(sensor, int):
             sensor = scene.sensors()[sensor]
@@ -359,14 +396,16 @@ class TransientRBIntegrator(TransientADIntegrator):
             with dr.suspend_grad():
                 ray, weight, pos = self.sample_rays(scene, sensor, sampler_i)
             
-                def splatting_and_backward_gradient_image(value: mi.Spectrum,
-                                                        weight: mi.Float,
-                                                        alpha: mi.Float,
-                                                        aovs: Sequence[mi.Float]):
-                    '''
-                    Backward propagation of the gradient image through the sample
-                    splatting and weight division steps.
-                    '''
+                # Differentiate sample splatting and weight division steps to
+                # retrieve the adjoint radiance (e.g. 'δL')
+                with dr.resume_grad():
+                    L = dr.full(mi.Spectrum, 1.0, dr.width(ray))
+                    dr.enable_grad(L)
+                    aovs = []
+                    for _ in self.aov_names():
+                        aov = dr.ones(mi.Float, dr.width(ray))
+                        dr.enable_grad(aov)
+                        aovs.append(aov) 
 
                     # Prepare an ImageBlock as specified by the film
                     block = film.steady.create_block()
@@ -376,10 +415,10 @@ class TransientRBIntegrator(TransientADIntegrator):
 
                     ADIntegrator._splat_to_block(
                         block, film, pos,
-                        value=value,
-                        weight=weight,
-                        alpha=alpha,
-                        aovs=aovs,
+                        value=L * weight,
+                        weight=1.0,
+                        alpha=1.0,
+                        aovs=[aov * weight for aov in aovs],
                         wavelengths=ray.wavelengths
                     )
 
@@ -389,63 +428,49 @@ class TransientRBIntegrator(TransientADIntegrator):
 
                     # Differentiate sample splatting and weight division steps
                     grad_in_image, grad_in_transient = grad_in
-                
-                    dr.set_grad(steady_image, grad_in_image)
-                    dr.enqueue(dr.ADMode.Backward, steady_image)
+                    # print(dr.sum(grad_in_image), dr.sum(grad_in_transient))
+                    # dr.set_grad(steady_image, grad_in_image)
+                    # dr.enqueue(dr.ADMode.Backward, steady_image)
+                    dr.enqueue(dr.ADMode.Backward, transient_image)
                     dr.traverse(dr.ADMode.Backward)
-                
-                    # Differentiate sample splatting and weight division steps to
-                    # retrieve the adjoint radiance (e.g. 'δL')
-                with dr.resume_grad():
-                    L = dr.full(mi.Spectrum, 1.0, dr.width(ray))
-                    dr.enable_grad(L)
-                    aovs = []
-                    for _ in self.aov_names():
-                        aov = dr.ones(mi.Float, dr.width(ray))
-                        dr.enable_grad(aov)
-                        aovs.append(aov) 
-                    splatting_and_backward_gradient_image(
-                        value=L * weight,
-                        weight=1.0,
-                        alpha=1.0,
-                        aovs=[aovs * weight for aovs in aovs]
-                    )
+
                     δL = dr.grad(L)
                     δaovs = dr.grad(aovs)
 
-                # Clear the dummy data splatted on the film above
-                film.clear()
+                    # Clear the dummy data splatted on the film above
+                    film.clear()
 
-                # Launch the Monte Carlo sampling process in primal mode (1)
-                L, valid, aovs, state_out = self.sample(
-                    mode=dr.ADMode.Primal,
-                    scene=scene,
-                    sampler=sampler_i.clone(),
-                    ray=ray,
-                    depth=mi.UInt32(0),
-                    δL=None,
-                    δaovs=None,
-                    state_in=None,
-                    active=mi.Bool(True),
-                    add_transient=self.add_transient_f(
-                        film=film, pos=pos, ray_weight=weight, sample_scale=1.0 / total_spp
+                    # Launch the Monte Carlo sampling process in primal mode (1)
+                    L, valid, aovs, state_out = self.sample(
+                        mode=dr.ADMode.Primal,
+                        scene=scene,
+                        sampler=sampler_i.clone(),
+                        ray=ray,
+                        depth=mi.UInt32(0),
+                        δL=None,
+                        δaovs=None,
+                        state_in=None,
+                        active=mi.Bool(True),
+                        add_transient=self.add_transient_f(
+                            film=film, pos=pos, ray_weight=weight, sample_scale=1.0 / total_spp
+                        )
                     )
-                )
 
-                L_2, valid_2, aovs_2, state_out_2 = self.sample(
-                    mode=dr.ADMode.Backward,
-                    scene=scene,
-                    sampler=sampler_i,
-                    ray=ray,
-                    depth=mi.UInt32(0),
-                    δL=δL,
-                    δaovs=δaovs,
-                    state_in=state_out,
-                    active=mi.Bool(True),
-                    add_transient=self.add_transient_f(
-                        film=film, pos=pos, ray_weight=weight, sample_scale=1.0 / total_spp
+                    L_2, valid_2, aovs_2, state_out_2 = self.sample(
+                        mode=dr.ADMode.Backward,
+                        scene=scene,
+                        sampler=sampler_i,
+                        ray=ray,
+                        depth=mi.UInt32(0),
+                        δL=δL,
+                        δaovs=δaovs,
+                        state_in=state_out,
+                        active=mi.Bool(True),
+                        add_transient=self.add_transient_f(
+                            film=film, pos=pos, ray_weight=weight, sample_scale=1.0 / total_spp
+                        )
                     )
-                )
 
-                del L_2, valid_2, aovs_2, state_out, state_out_2, δL, δaovs, ray, weight, pos, sampler_i
-                dr.eval()
+                    del L_2, valid_2, aovs_2, state_out, state_out_2, δL, δaovs, ray, weight, pos, sampler_i
+                    dr.eval()
+                    return
